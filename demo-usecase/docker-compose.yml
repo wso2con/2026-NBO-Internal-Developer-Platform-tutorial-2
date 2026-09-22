@@ -1,0 +1,286 @@
+# mopay - local development stack.
+#
+# README.md working method: "Compose before Kubernetes. Get every component working under
+# docker-compose up with the seeder before touching OpenChoreo."
+#
+# Constraint 5: every environment-specific value arrives as an environment variable.
+# Constraint 6: credentials come from .env, which is gitignored, never from this file.
+
+# Pin the project name. Compose otherwise derives it from the directory, so the same
+# checkout under a different folder name would start a second, separate stack with its own
+# volume - and `docker compose ps` from one directory would not see containers started
+# from another. Container names are therefore always mopay-*.
+name: mopay
+
+x-postgres-env: &postgres-env
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB}
+
+# No ENVIRONMENT: ledger, collections-api and settlement-worker no longer read one. On
+# the platform the environment is a label the platform itself applies; under Compose
+# there is only ever one.
+x-app-env: &app-env
+  DATA_REGION: ${DATA_REGION}
+  LOG_LEVEL: ${LOG_LEVEL}
+  HOUSE_ACCOUNT_ID: mopay_house
+
+# ONLY `ledger` gets a database connection. collections-api, settlement-worker and the
+# console reach the data through it. One component with a pool is what lets the platform
+# express a single rule - replicas x DB_MAX_CONNS <= max_connections - instead of trying
+# to cap three pools independently and hope the sum fits.
+x-ledger-db-env: &ledger-db-env
+  # Connects as the APPLICATION role, which holds no UPDATE or DELETE on ledger_entries
+  # or settlement_lines (hard constraint 1, migration 002).
+  DATABASE_URL: postgres://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+
+services:
+  postgres:
+    image: postgres:16
+    # max_connections is the SHARED ceiling every component draws from. Each service's
+    # DB_MAX_CONNS is only a per-component slice of this number; sizing one without the
+    # other is how a system runs out of connections at peak. Postgres additionally holds
+    # back superuser_reserved_connections (3 by default), so the usable figure is lower.
+    command:
+      - postgres
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-100}
+    environment:
+      <<: *postgres-env
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PUBLISH_PORT:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Applies db/migrations in order, as the owner role, then exits.
+  migrate:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *postgres-env
+      POSTGRES_USER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      APP_DB_USER: ${APP_DB_USER}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+      DATA_REGION: ${DATA_REGION}
+      HOUSE_ACCOUNT_ID: mopay_house
+    volumes:
+      - ./db/migrations:/migrations:ro
+      - ./db/migrate.sh:/migrate.sh:ro
+    entrypoint: ["/bin/sh", "/migrate.sh"]
+
+  # Hard constraint 8: `ledger` is never reachable from the console or from outside the
+  # project. It therefore publishes NO port - only other compose services can reach it.
+  ledger:
+    build:
+      context: ./ledger
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: [*app-env, *ledger-db-env]
+      PORT: "8080"
+      # The only pool in the system. Defaults are 10/10; DB_MAX_CONNS may be raised per
+      # environment but ledger refuses to start if it is below DB_MIN_CONNS.
+      DB_MAX_CONNS: ${LEDGER_DB_MAX_CONNS:-10}
+      DB_MIN_CONNS: ${LEDGER_DB_MIN_CONNS:-10}
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "/ledger", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # --- merchant-api ---------------------------------------------------------
+  # The system of record for merchant identity, and a SEPARATE project on the platform.
+  # It therefore gets its own Postgres: separate instance, separate credentials, its own
+  # connection budget. Nothing here shares state with mopay's database, and merchant-api
+  # cannot consume connections mopay's components need.
+  merchant-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${MERCHANT_POSTGRES_DB}
+      POSTGRES_USER: ${MERCHANT_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${MERCHANT_POSTGRES_PASSWORD}
+    ports:
+      - "${MERCHANT_POSTGRES_PUBLISH_PORT:-55433}:5432"
+    volumes:
+      - merchant_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${MERCHANT_POSTGRES_USER} -d ${MERCHANT_POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  merchant-migrate:
+    image: postgres:16
+    depends_on:
+      merchant-postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: merchant-postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${MERCHANT_POSTGRES_DB}
+      POSTGRES_USER: ${MERCHANT_POSTGRES_USER}
+      PGPASSWORD: ${MERCHANT_POSTGRES_PASSWORD}
+      APP_DB_USER: ${MERCHANT_APP_DB_USER}
+      APP_DB_PASSWORD: ${MERCHANT_APP_DB_PASSWORD}
+    volumes:
+      - ./merchant-api/db/migrations:/migrations:ro
+      - ./merchant-api/db/migrate.sh:/migrate.sh:ro
+    entrypoint: ["/bin/sh", "/migrate.sh"]
+
+  merchant-api:
+    build:
+      context: ./merchant-api
+    depends_on:
+      merchant-postgres:
+        condition: service_healthy
+      merchant-migrate:
+        condition: service_completed_successfully
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT}
+      LOG_LEVEL: ${LOG_LEVEL}
+      PORT: "8080"
+      DATABASE_URL: postgres://${MERCHANT_APP_DB_USER}:${MERCHANT_APP_DB_PASSWORD}@merchant-postgres:5432/${MERCHANT_POSTGRES_DB}?sslmode=disable
+      DB_MAX_CONNS: ${MERCHANT_DB_MAX_CONNS:-10}
+      DB_MIN_CONNS: ${MERCHANT_DB_MIN_CONNS:-0}
+      # The console lists merchants from here directly, so its origin must be allowed.
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173}
+    ports:
+      - "${MERCHANT_API_PUBLISH_PORT:-8092}:8080"
+    healthcheck:
+      test: ["CMD", "/merchant-api", "-healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+  # --- end merchant-api -----------------------------------------------------
+
+  collections-api:
+    build:
+      context: ./collections-api
+    # No postgres dependency: this service has no database connection. It depends on
+    # `ledger`, which does.
+    depends_on:
+      ledger:
+        condition: service_healthy
+      merchant-api:
+        condition: service_healthy
+    environment:
+      <<: *app-env
+      PORT: "8080"
+      # Constraint 5: the ledger's address is injected, never hardcoded in the image.
+      LEDGER_BASE_URL: http://ledger:8080
+      # merchant-api is a SEPARATE project. Its address is injected like any other
+      # (constraint 5); on the platform this comes from the connection, not a hostname.
+      MERCHANT_API_BASE_URL: ${MERCHANT_API_BASE_URL:-http://merchant-api:8080}
+      MERCHANT_API_TIMEOUT: ${MERCHANT_API_TIMEOUT:-3s}
+      MERCHANT_CACHE_TTL: ${MERCHANT_CACHE_TTL:-60s}
+      LAG_REFRESH_INTERVAL: ${LAG_REFRESH_INTERVAL}
+      SETTLEMENT_STALENESS_THRESHOLD: ${SETTLEMENT_STALENESS_THRESHOLD}
+      SETTLEMENT_LAG_ALERT_THRESHOLD: ${SETTLEMENT_LAG_ALERT_THRESHOLD}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173}
+    ports:
+      - "${COLLECTIONS_PUBLISH_PORT:-8081}:8080"
+    restart: unless-stopped
+
+  # --- settlement-worker ----------------------------------------------------
+  # README constraint 9: this component may need to leave the repository later, as a
+  # `git rm -r settlement-worker/` plus one deploy edit. This block is that one edit -
+  # keep it contiguous and do not reference the worker from other services.
+  settlement-worker:
+    build:
+      context: ./settlement-worker
+    # No postgres dependency: this component has no database connection either.
+    depends_on:
+      ledger:
+        condition: service_healthy
+    environment:
+      <<: *app-env
+      LEDGER_BASE_URL: http://ledger:8080
+      RUN_MODE: ${RUN_MODE}
+      RUN_INTERVAL: ${RUN_INTERVAL}
+      RUN_WINDOW: ${RUN_WINDOW}
+      SETTLEMENT_PERIOD_HOURS: ${SETTLEMENT_PERIOD_HOURS}
+      FORCE_MONTH_END: ${FORCE_MONTH_END}
+      SETTLEMENT_FAIL_AT_MERCHANT: ${SETTLEMENT_FAIL_AT_MERCHANT:-}
+    restart: unless-stopped
+  # --- end settlement-worker ------------------------------------------------
+
+  # Run on demand: `make seed`, not part of `up`.
+  seed:
+    build:
+      context: ./seed
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL}
+      HOUSE_ACCOUNT_ID: mopay_house
+      # The seeder runs as the OWNER: `reset` truncates, and the application role
+      # deliberately cannot delete from the append-only tables.
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+
+  # Peak-hour traffic generator. Run on demand: `make load`, never part of `up`.
+  # It drives the PUBLIC intake path over HTTP so that collections-api and - through the
+  # C-1.5 balance check - the ledger's connection pool both come under real concurrent
+  # demand. `seed` writes straight to Postgres and would bypass both.
+  loadgen:
+    build:
+      context: ./loadgen
+    profiles: ["tools"]
+    depends_on:
+      - collections-api
+    environment:
+      LOADGEN_BASE_URL: http://collections-api:8080
+      LOADGEN_MERCHANT_IDS: ${LOADGEN_MERCHANT_IDS}
+      LOADGEN_CHANNEL: ${LOADGEN_CHANNEL}
+      LOADGEN_CONCURRENCY: ${LOADGEN_CONCURRENCY:-50}
+      LOADGEN_RATE: ${LOADGEN_RATE:-0}
+      LOADGEN_DURATION: ${LOADGEN_DURATION:-0}
+      # C-1.5 refuses a collection once the merchant's unsettled balance would pass its
+      # float limit, so sustained load needs amounts the limits can absorb between
+      # settlement runs. These defaults stay under the smallest seeded float limit.
+      LOADGEN_AMOUNT_MIN_MINOR: ${LOADGEN_AMOUNT_MIN_MINOR:-1000}
+      LOADGEN_AMOUNT_MAX_MINOR: ${LOADGEN_AMOUNT_MAX_MINOR:-20000}
+      LOADGEN_CLEAR_RATIO: ${LOADGEN_CLEAR_RATIO:-1.0}
+      LOADGEN_REPORT_INTERVAL: ${LOADGEN_REPORT_INTERVAL:-5s}
+
+  mopay-console:
+    build:
+      context: ./mopay-console
+    environment:
+      # Constraint 5: injected at container start, not baked into the image, so the same
+      # artifact promotes between environments. Browser addresses, not in-network ones:
+      # these are fetched by the user's browser.
+      API_BASE_URL: ${CONSOLE_API_BASE_URL:-http://localhost:8081}
+      MERCHANT_API_BASE_URL: ${CONSOLE_MERCHANT_API_BASE_URL:-http://localhost:8092}
+    profiles: ["console"]
+    depends_on:
+      - collections-api
+    ports:
+      - "${CONSOLE_PUBLISH_PORT:-5173}:8080"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  merchant_pgdata:

@@ -1,0 +1,427 @@
+openapi: 3.1.0
+info:
+  title: mopay merchant-api
+  version: "1.0.0"
+  description: |
+    **The system of record for merchant identity** on the mopay collections platform.
+
+    A merchant is onboarded here once, and every other system reads its identity, payout
+    destination, float limit and fee schedule from this API. Nothing else may create a
+    merchant, and no other store is authoritative for these fields.
+
+    ## Who calls this
+
+    | Caller | Operation | Why |
+    |---|---|---|
+    | An onboarding console or back-office tool | `onboardMerchant` | Creating the merchant |
+    | `collections-api` | `getMerchant` | Resolving the merchant on collection intake — the float limit and currency are needed to decide whether a collection can be accepted |
+    | Reporting and platform tooling | `listMerchants` | Enumerating merchants |
+
+    `collections-api` caches the result of `getMerchant` for a short, configurable TTL, so
+    a change made here becomes visible to intake within that window rather than instantly.
+
+    ## Money
+
+    All monetary amounts are **integer minor units** (cents, kobo) in a named currency —
+    never decimals, never floats. `floatLimitMinor: 500000` with
+    `floatLimitCurrency: "KES"` means KES 5,000.00. Fee percentages are **basis points**
+    (integers): `percentageBp: 150` is 1.50%.
+
+    ## Time
+
+    All timestamps are UTC, RFC 3339.
+
+    ## Data residency
+
+    `dataRegion` fixes which region's datastore holds this merchant's transaction data.
+    It is **immutable after creation** — there is deliberately no operation that changes
+    it, because moving a merchant between regions would move data across a boundary that
+    is required to stay sealed.
+
+    ## Authentication
+
+    Dev-mode bearer tokens, not OIDC. OIDC, identity providers, login screens and session
+    management are out of scope for this platform.
+
+        Authorization: Bearer dev.<base64url({"sub":"...","merchantId":"...","role":"..."})>
+
+    Authorization is **not** dev-mode and is enforced server-side on every request.
+  contact:
+    name: mopay platform team
+    email: platform@mopay.example
+
+servers:
+  - url: http://localhost:8092
+    description: Local Compose
+  - url: http://merchant-api:8080
+    description: In-cluster service address
+
+tags:
+  - name: merchants
+    description: "Merchant onboarding and identity lookup."
+
+security:
+  - devBearer: []
+
+paths:
+  /healthz:
+    get:
+      tags: [merchants]
+      summary: Liveness and readiness
+      operationId: health
+      description: "Reports whether the service is running and its datastore is reachable. Unauthenticated, for platform probes."
+      security: []
+      responses:
+        "200":
+          description: "Service is healthy."
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, examples: ["ok"] }
+                  service: { type: string, examples: ["merchant-api"] }
+        "503":
+          description: "The datastore is unreachable."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/merchants:
+    get:
+      tags: [merchants]
+      summary: List merchants
+      operationId: listMerchants
+      description: |
+        Returns a page of merchants, newest first. Call this to enumerate merchants — for
+        a back-office list, a reconciliation job, or to discover which merchants exist.
+        To resolve a single known merchant, call `getMerchant` instead; it is cheaper and
+        is the operation intended for the intake path.
+      parameters:
+        - name: dataRegion
+          in: query
+          required: false
+          description: "Return only merchants whose data is held in this region."
+          schema: { $ref: "#/components/schemas/Region" }
+        - name: limit
+          in: query
+          required: false
+          description: "Maximum number of merchants to return."
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+          example: 50
+        - name: offset
+          in: query
+          required: false
+          description: "Number of merchants to skip, for paging through the collection."
+          schema: { type: integer, minimum: 0, default: 0 }
+          example: 0
+      responses:
+        "200":
+          description: "A page of merchants."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, total, limit, offset]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Merchant" }
+                  total:
+                    type: integer
+                    format: int64
+                    description: "Total merchants matching the filter, ignoring limit and offset."
+                  limit: { type: integer }
+                  offset: { type: integer }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+    post:
+      tags: [merchants]
+      summary: Onboard a merchant
+      operationId: onboardMerchant
+      description: |
+        Creates a merchant and returns it with its server-assigned `id`. This is the only
+        way a merchant comes into existence on the platform.
+
+        The `id` is assigned here, not supplied by the caller. Use the returned `id` in
+        the bearer token of any subsequent call made on that merchant's behalf.
+
+        `dataRegion` is fixed permanently by this call — see the schema. Provide a fee
+        schedule for every channel the merchant will collect on; a collection on a channel
+        with no fee schedule cannot be settled.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MerchantOnboardRequest" }
+            example:
+              name: "Nakuru Fresh Produce"
+              country: "KE"
+              dataRegion: "KE"
+              payoutBank: "Equity Bank Kenya"
+              payoutAccountNumber: "0170123456789"
+              payoutAccountName: "Nakuru Fresh Produce Ltd"
+              floatLimitMinor: 500000000
+              floatLimitCurrency: "KES"
+              feeSchedules:
+                - channel: "mpesa"
+                  percentageBp: 150
+                  fixedMinor: 1000
+      responses:
+        "201":
+          description: "The merchant was created."
+          headers:
+            Location:
+              description: "URL of the newly created merchant."
+              schema: { type: string, examples: ["/v1/merchants/mch_9f2a1c4ccada9a8b"] }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Merchant" }
+        "400":
+          description: |
+            The request is malformed or internally inconsistent. Common causes, each
+            named specifically in the `message`: a fee schedule for a channel that does
+            not settle in the merchant's currency, a negative float limit, or a
+            `percentageBp` outside 0-10000.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/merchants/{merchantId}:
+    parameters:
+      - name: merchantId
+        in: path
+        required: true
+        description: "The merchant's platform identifier, as returned by `onboardMerchant`."
+        schema: { $ref: "#/components/schemas/MerchantId" }
+    get:
+      tags: [merchants]
+      summary: Get a merchant by id
+      operationId: getMerchant
+      description: |
+        Returns one merchant's full identity: payout destination, float limit and fee
+        schedules.
+
+        **This is the operation on the collection intake path.** `collections-api` calls
+        it to obtain `floatLimitMinor` and `floatLimitCurrency` before accepting a
+        collection, so it is latency-sensitive and is expected to be cached by callers for
+        a short TTL.
+
+        A merchant that does not exist returns `404` with code `not_found`. Callers should
+        treat that as "this merchant cannot transact" rather than retrying.
+      responses:
+        "200":
+          description: "The merchant."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Merchant" }
+              example:
+                id: "mch_001"
+                name: "Nakuru Fresh Produce"
+                country: "KE"
+                dataRegion: "KE"
+                payoutBank: "Equity Bank Kenya"
+                payoutAccountMask: "****6789"
+                payoutAccountName: "Nakuru Fresh Produce Ltd"
+                floatLimitMinor: 500000000
+                floatLimitCurrency: "KES"
+                feeSchedules:
+                  - channel: "mpesa"
+                    percentageBp: 150
+                    fixedMinor: 1000
+                createdAt: "2026-01-14T08:21:04Z"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+components:
+  securitySchemes:
+    devBearer:
+      type: http
+      scheme: bearer
+      description: |
+        A dev-mode bearer token: the literal prefix `dev.` followed by a base64url-encoded
+        JSON claims object carrying `sub`, `merchantId` and `role`. It is not a JWT and is
+        deliberately not named like one.
+
+  schemas:
+    MerchantId:
+      type: string
+      pattern: "^mch_[A-Za-z0-9]+$"
+      description: "Platform identifier for a merchant, assigned at onboarding."
+      examples: ["mch_001", "mch_9f2a1c4ccada9a8b"]
+
+    Region:
+      type: string
+      enum: [KE, NG]
+      description: "A data residency region. `KE` is Kenya, `NG` is Nigeria."
+
+    Currency:
+      type: string
+      enum: [KES, NGN]
+      description: "ISO 4217 currency. `KES` pairs with region `KE`, `NGN` with `NG`."
+
+    Channel:
+      type: string
+      enum: [mpesa, nibss_transfer]
+      description: |
+        A collection channel. `mpesa` is Kenyan and settles in `KES`; `nibss_transfer` is
+        Nigerian and settles in `NGN`. The channel determines the currency of a
+        collection — it is never supplied by the payer.
+
+    FeeSchedule:
+      type: object
+      description: "What the platform charges this merchant on one channel. Fees are per merchant AND per channel."
+      required: [channel, percentageBp, fixedMinor]
+      properties:
+        channel: { $ref: "#/components/schemas/Channel" }
+        percentageBp:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: "Percentage of the collection, in basis points. 150 means 1.50%. An integer, never a float, so fee arithmetic is exact."
+          examples: [150]
+        fixedMinor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: "Flat component charged per collection, in minor units of the channel's currency."
+          examples: [1000]
+
+    MerchantOnboardRequest:
+      type: object
+      required: [name, country, dataRegion, payoutBank, payoutAccountNumber, payoutAccountName, floatLimitMinor, floatLimitCurrency, feeSchedules]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: "The merchant's trading name, as it should appear on statements."
+          examples: ["Nakuru Fresh Produce"]
+        country: { $ref: "#/components/schemas/Region" }
+        dataRegion:
+          allOf:
+            - $ref: "#/components/schemas/Region"
+          description: "Where this merchant's transaction data will be held. **Immutable after creation** — no operation on this API changes it."
+        payoutBank:
+          type: string
+          description: "Bank holding the account settlements are paid into."
+          examples: ["Equity Bank Kenya"]
+        payoutAccountNumber:
+          type: string
+          description: "Full payout account number. Accepted here at onboarding; never returned by any read operation — reads return `payoutAccountMask` instead."
+          examples: ["0170123456789"]
+        payoutAccountName:
+          type: string
+          description: "Account holder name, for payout instruction matching."
+          examples: ["Nakuru Fresh Produce Ltd"]
+        floatLimitMinor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: "The most this merchant may hold in collected-but-unsettled funds, in minor units. A collection that would take the merchant past this limit is refused at intake."
+          examples: [500000000]
+        floatLimitCurrency: { $ref: "#/components/schemas/Currency" }
+        feeSchedules:
+          type: array
+          minItems: 1
+          description: "One entry per channel the merchant will collect on. A collection on a channel absent from this list cannot be settled."
+          items: { $ref: "#/components/schemas/FeeSchedule" }
+
+    Merchant:
+      type: object
+      description: "A merchant as held by the system of record."
+      required: [id, name, country, dataRegion, payoutBank, payoutAccountMask, payoutAccountName, floatLimitMinor, floatLimitCurrency, feeSchedules, createdAt]
+      properties:
+        id: { $ref: "#/components/schemas/MerchantId" }
+        name:
+          type: string
+          examples: ["Nakuru Fresh Produce"]
+        country: { $ref: "#/components/schemas/Region" }
+        dataRegion:
+          allOf:
+            - $ref: "#/components/schemas/Region"
+          description: "Where this merchant's transaction data is held. Immutable after creation."
+        payoutBank:
+          type: string
+          examples: ["Equity Bank Kenya"]
+        payoutAccountMask:
+          type: string
+          description: "The payout account number with all but the last four digits masked. The full number is never returned by a read operation."
+          examples: ["****6789"]
+        payoutAccountName:
+          type: string
+          examples: ["Nakuru Fresh Produce Ltd"]
+        floatLimitMinor:
+          type: integer
+          format: int64
+          description: "Ceiling on collected-but-unsettled funds, in minor units of `floatLimitCurrency`."
+          examples: [500000000]
+        floatLimitCurrency: { $ref: "#/components/schemas/Currency" }
+        feeSchedules:
+          type: array
+          description: "Every channel this merchant may collect on, with its fee terms."
+          items: { $ref: "#/components/schemas/FeeSchedule" }
+        createdAt:
+          type: string
+          format: date-time
+          description: "When the merchant was onboarded, UTC."
+          examples: ["2026-01-14T08:21:04Z"]
+
+    Error:
+      type: object
+      description: "Every failure returns this shape. `code` is stable and machine-readable; `message` names the specific condition and the identifiers involved."
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: "Stable machine-readable error code. Branch on this, not on `message`."
+          enum:
+            - bad_request
+            - unauthorized
+            - forbidden
+            - not_found
+            - conflict
+            - unprocessable
+            - internal_error
+        message:
+          type: string
+          description: "Human-readable description naming the condition and the affected identifiers."
+          examples: ["merchant mch_404 does not exist"]
+        details:
+          type: object
+          additionalProperties: true
+          description: "Optional structured values a caller can act on programmatically."
+
+  responses:
+    BadRequest:
+      description: "The request was malformed. The `message` names the offending field."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: "No bearer token, or the token could not be parsed."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: "The token is valid but its role may not perform this operation."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: "No merchant with that id exists."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InternalError:
+      description: "An unexpected failure. The detail is logged, never returned."
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
