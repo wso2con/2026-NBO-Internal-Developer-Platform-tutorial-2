@@ -1,0 +1,465 @@
+openapi: 3.1.0
+info:
+  title: mopay ledger
+  version: "1.0.0"
+  description: |
+    The append-only double-entry ledger (PRD §5.5).
+
+    **This API is internal.** Hard constraint 8: `ledger` is reachable only from
+    `collections-api` and `settlement-worker` — never from the console and never from
+    outside the project. Every path is under `/internal` and the component publishes no
+    externally-visible endpoint.
+
+    Money is always integer minor units with an explicit currency. Timestamps are UTC.
+
+servers:
+  - url: http://ledger:8080
+    description: In-project address. Injected as LEDGER_BASE_URL, never hardcoded.
+
+tags:
+  - name: ledger
+  - name: settlement
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness and readiness
+      operationId: health
+      security: []
+      responses:
+        "200":
+          description: Service is up and the datastore is reachable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, examples: ["ok"] }
+                  service: { type: string, examples: ["ledger"] }
+        "503":
+          description: The datastore is not reachable
+
+  /metrics:
+    get:
+      summary: Prometheus metrics (OBS-2)
+      operationId: metrics
+      security: []
+      responses:
+        "200":
+          description: Metrics in Prometheus text exposition format
+          content:
+            text/plain: { schema: { type: string } }
+
+  /internal/ledger/entries:
+    post:
+      tags: [ledger]
+      summary: Append a balanced group of ledger entries
+      operationId: writeEntries
+      description: |
+        Appends one transaction group (C-3.1).
+
+        **Every write must balance (C-3.5).** Entries sharing a `transactionGroupId` must
+        sum to zero, treating credit as positive and debit as negative. A write that does
+        not balance is rejected with `ledger_not_balanced`, and the error carries the
+        group id and the actual sum so the caller can act on it without re-deriving it.
+
+        A group is single-currency: mixing KES and NGN is rejected rather than netted.
+
+        Idempotent on `transactionGroupId` — a repeat returns the stored entries and
+        creates nothing, so a caller that retried after a timeout does not double-post.
+
+        There is no update and no delete operation for a ledger entry, and none will be
+        added (C-3.3). The application role holds no UPDATE or DELETE grant on the table.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EntryGroup" }
+      responses:
+        "201":
+          description: The group was appended
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transactionGroupId: { type: string }
+                  entries:
+                    type: array
+                    items: { $ref: "#/components/schemas/LedgerEntry" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "422":
+          description: The write did not balance, or mixed currencies
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                notBalanced:
+                  value:
+                    code: ledger_not_balanced
+                    message: "ledger write did not balance (group tg_99a2, sum -250.00 KES)"
+                    details:
+                      transactionGroupId: tg_99a2
+                      sumMinor: -25000
+                      currency: KES
+
+    get:
+      tags: [ledger]
+      summary: Entries produced by one business event
+      operationId: entriesByEvent
+      description: |
+        Every entry references the business event that produced it (C-3.4). This is how
+        `collections-api` renders collection detail with its ledger entries (C-1.9).
+      parameters:
+        - name: eventType
+          in: query
+          required: true
+          schema: { type: string, enum: [collection, fee, settlement, correction] }
+        - name: eventId
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: The entries for that event, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items: { $ref: "#/components/schemas/LedgerEntry" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /internal/ledger/balances/{merchantId}:
+    get:
+      tags: [ledger]
+      summary: A merchant's balance, optionally as of a past timestamp
+      operationId: balance
+      description: |
+        Computes a merchant's balance at any point in time (C-3.2), as
+        `SUM(credit) - SUM(debit)` over entries created at or before `asOf`.
+
+        The result is the merchant's unsettled balance: what mopay currently holds for
+        them. `collections-api` uses it for the float-limit check (C-1.5).
+      parameters:
+        - name: merchantId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: asOf
+          in: query
+          required: false
+          description: RFC3339 UTC timestamp. Defaults to now.
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: The balance
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Balance" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /internal/settlements/pending:
+    get:
+      tags: [settlement]
+      summary: Every unsettled cleared collection in a period (UNPAGINATED BY DESIGN)
+      operationId: pendingSettlements
+      description: |
+        Returns **every** `cleared`, unsettled collection in the period for the region,
+        each element carrying the collection, its ledger entries, the merchant's fee
+        schedule for that channel, and the payout metadata a settlement run needs.
+
+        ## This endpoint is deliberately unpaginated
+
+        There is no `limit`, no `offset`, no `cursor` and no result cap, and none will be
+        added. This is the honest read path for full-period reconciliation (C-2.2):
+        **a period you can only see one page of cannot be reconciled.** A settlement run
+        must consider the whole period as one set to produce a correct net amount per
+        merchant, so the caller is expected to hold the entire result in memory.
+
+        This is a recorded design decision (README hard constraint 3), not an
+        oversight, and it is not a defect to be fixed. `seed volume` reports the
+        serialised size of this response at month-end scale so the cost is known rather
+        than assumed.
+
+        ## Residency
+
+        The `region` filter applies to the merchant's `dataRegion`, so a run in one region
+        can never read the other region's transaction rows (RES-1, RES-4).
+      parameters:
+        - name: region
+          in: query
+          required: true
+          schema: { type: string, enum: [KE, NG] }
+        - name: periodStart
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+        - name: periodEnd
+          in: query
+          required: true
+          description: Exclusive upper bound.
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: The complete set for the period. No pagination metadata, because there are no further pages.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [region, periodStart, periodEnd, rowCount, items]
+                properties:
+                  region: { type: string, enum: [KE, NG] }
+                  periodStart: { type: string, format: date-time }
+                  periodEnd: { type: string, format: date-time }
+                  rowCount: { type: integer, description: Number of elements in items. Not a page size. }
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/PendingCollection" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /internal/settlements/commit:
+    post:
+      tags: [settlement]
+      summary: Settle one merchant, atomically
+      operationId: commitSettlement
+      description: |
+        Commits one merchant's settlement for one run, in a single database transaction:
+        the immutable settlement line, the payout instruction (C-2.4), the fee and
+        settlement ledger entries, and the collection status updates all commit or roll
+        back together.
+
+        **The unit of work is the merchant, not the run.** C-2.6 requires that a failure
+        affecting one merchant leaves no other merchant partially settled, which is only
+        achievable if each merchant commits independently.
+
+        **Idempotent (C-2.7).** Re-running a period must not double-settle. Idempotency is
+        keyed on the collection: the update only moves collections still in `cleared`, and
+        a unique constraint on `(runId, merchantId)` prevents a second line for the same
+        run. A repeat returns the existing line with `alreadySettled: true` and HTTP 200.
+
+        Settlement lines are immutable once written (C-2.3, NFR-6). There is no operation
+        to amend or delete one.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CommitRequest" }
+      responses:
+        "201":
+          description: The merchant was settled by this call
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "200":
+          description: Already settled by an earlier attempt at this run; nothing changed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409":
+          description: Another run settled some of these collections concurrently
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "422":
+          description: gross, fees and net are inconsistent
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+components:
+  responses:
+    BadRequest:
+      description: The request was malformed
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: The resource does not exist
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      description: |
+        The shared error shape. `code` is stable and machine-readable; `details` carries
+        the relevant values so a caller can act programmatically.
+      properties:
+        code:
+          type: string
+          enum:
+            - bad_request
+            - unauthorized
+            - forbidden
+            - not_found
+            - conflict
+            - unprocessable
+            - internal_error
+            - upstream_unavailable
+            - ledger_not_balanced
+            - append_only_violation
+            - invalid_status_transition
+            - unsupported_channel
+        message: { type: string }
+        details:
+          type: object
+          additionalProperties: true
+
+    Money:
+      type: integer
+      format: int64
+      description: Integer minor units. Never a float. 1 KES = 100 minor units.
+
+    Currency:
+      type: string
+      enum: [KES, NGN]
+
+    LedgerEntry:
+      type: object
+      required: [id, merchantId, direction, amountMinor, currency, createdAt, eventType, eventId, transactionGroupId]
+      properties:
+        id: { type: string }
+        merchantId:
+          type: string
+          description: |
+            The account. mopay's own book is a reserved merchant id (the house account),
+            because PRD §7 gives LedgerEntry no separate account column.
+        direction: { type: string, enum: [debit, credit] }
+        amountMinor: { $ref: "#/components/schemas/Money" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        createdAt: { type: string, format: date-time }
+        eventType: { type: string, enum: [collection, fee, settlement, correction] }
+        eventId:
+          type: string
+          description: The business event that produced this entry (C-3.4).
+        transactionGroupId:
+          type: string
+          description: Entries sharing this value sum to zero (C-3.5).
+
+    EntryGroup:
+      type: object
+      required: [transactionGroupId, eventType, eventId, entries]
+      properties:
+        transactionGroupId: { type: string }
+        eventType: { type: string, enum: [collection, fee, settlement, correction] }
+        eventId: { type: string }
+        entries:
+          type: array
+          minItems: 2
+          description: Must sum to zero and share one currency.
+          items:
+            type: object
+            required: [merchantId, direction, amountMinor, currency]
+            properties:
+              merchantId: { type: string }
+              direction: { type: string, enum: [debit, credit] }
+              amountMinor:
+                allOf: [{ $ref: "#/components/schemas/Money" }]
+                description: Always positive. The direction carries the sign.
+              currency: { $ref: "#/components/schemas/Currency" }
+
+    Balance:
+      type: object
+      required: [merchantId, amountMinor, currency, asOf, entryCount]
+      properties:
+        merchantId: { type: string }
+        amountMinor:
+          allOf: [{ $ref: "#/components/schemas/Money" }]
+          description: SUM(credit) - SUM(debit). What mopay holds for this merchant.
+        currency: { $ref: "#/components/schemas/Currency" }
+        asOf: { type: string, format: date-time }
+        entryCount: { type: integer, format: int64 }
+
+    FeeSchedule:
+      type: object
+      description: Per-merchant, per-channel fee (C-2.8).
+      properties:
+        channel: { type: string, enum: [mpesa, nibss_transfer] }
+        percentageBp:
+          type: integer
+          description: Basis points. 150 = 1.5%. Integer, so no float touches a money value.
+        fixedMinor: { $ref: "#/components/schemas/Money" }
+
+    PendingCollection:
+      type: object
+      description: One unsettled cleared collection, with everything a settlement run needs.
+      required: [collectionId, merchantId, channel, amountMinor, currency, createdAt]
+      properties:
+        collectionId: { type: string }
+        merchantId: { type: string }
+        merchantName: { type: string }
+        channel: { type: string, enum: [mpesa, nibss_transfer] }
+        amountMinor: { $ref: "#/components/schemas/Money" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        merchantReference: { type: string }
+        originCountry: { type: string, enum: [KE, NG] }
+        createdAt: { type: string, format: date-time }
+        clearedAt: { type: [string, "null"], format: date-time }
+        ledgerEntries:
+          type: array
+          items: { $ref: "#/components/schemas/LedgerEntry" }
+        feeSchedule:
+          oneOf:
+            - { $ref: "#/components/schemas/FeeSchedule" }
+            - { type: "null" }
+        payoutBank: { type: string }
+        payoutAccountName: { type: string }
+
+    CommitRequest:
+      type: object
+      required: [runId, merchantId, collectionIds, grossMinor, feesMinor, netMinor, currency]
+      properties:
+        runId: { type: string }
+        merchantId: { type: string }
+        collectionIds:
+          type: array
+          minItems: 1
+          items: { type: string }
+          description: |
+            The exact set this commit settles. Fees are computed per collection from that
+            collection's channel schedule by the caller, so a merchant trading on more
+            than one channel settles correctly.
+        grossMinor: { $ref: "#/components/schemas/Money" }
+        feesMinor: { $ref: "#/components/schemas/Money" }
+        netMinor:
+          allOf: [{ $ref: "#/components/schemas/Money" }]
+          description: Must equal grossMinor - feesMinor.
+        currency: { $ref: "#/components/schemas/Currency" }
+        settledAt: { type: string, format: date-time }
+
+    SettlementLine:
+      type: object
+      description: Immutable once written (C-2.3, NFR-6).
+      properties:
+        id: { type: string }
+        runId: { type: string }
+        merchantId: { type: string }
+        grossMinor: { $ref: "#/components/schemas/Money" }
+        feesMinor: { $ref: "#/components/schemas/Money" }
+        netMinor: { $ref: "#/components/schemas/Money" }
+        currency: { $ref: "#/components/schemas/Currency" }
+        correctsLineId:
+          type: [string, "null"]
+          description: |
+            Correction settlement lines are a README.md non-goal (SCOPE.md conflict 6).
+            The field exists per PRD §7 and is always null; there is no correction path.
+        rowCount: { type: integer, format: int64 }
+        createdAt: { type: string, format: date-time }
+
+    CommitResult:
+      type: object
+      properties:
+        line: { $ref: "#/components/schemas/SettlementLine" }
+        alreadySettled:
+          type: boolean
+          description: True when this run had already settled this merchant (C-2.7).
+        payoutId: { type: string }
+
+security: []

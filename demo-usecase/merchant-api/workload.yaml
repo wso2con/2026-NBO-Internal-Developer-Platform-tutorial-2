@@ -1,0 +1,33 @@
+# OpenChoreo workload descriptor for `merchant-api`.
+#
+# The system of record for merchant identity, owned by a different team and living in
+# its own project with its own database.
+apiVersion: openchoreo.dev/v1alpha1
+
+metadata:
+  name: merchant-api
+
+endpoints:
+  - name: api
+    port: 8080
+    type: HTTP
+    # Two visibilities, for two different callers:
+    #   namespace — collections-api, across the project boundary, in-cluster
+    #   external  — the console, which lists merchants straight from the browser
+    visibility: [namespace, external]
+
+dependencies:
+  resources:
+    - ref: merchant-db
+      envBindings:
+        url: DATABASE_URL
+
+configurations:
+  env:
+    - name: ENVIRONMENT
+      value: development
+    - name: LOG_LEVEL
+      value: info
+    # Same origin as the console — see collections-api's descriptor.
+    - name: CORS_ALLOWED_ORIGINS
+      value: ""

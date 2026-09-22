@@ -1,0 +1,12 @@
+-- Remove settlement_runs.environment.
+--
+-- The column recorded which environment produced a run, written from each component's
+-- ENVIRONMENT variable. Nothing ever read it as a predicate - every query against
+-- settlement_runs filters on `region` - and it could not discriminate anyway: prod-ke and
+-- prod-ng hold separate databases (hard constraint 7), so every row in a given database
+-- carried the same value. The platform already labels logs and metrics with the
+-- environment it collected them from, which is the one source of that fact worth keeping.
+--
+-- 001 no longer creates the column. This migration exists for databases provisioned
+-- before that change; it is idempotent and a no-op on a fresh one.
+ALTER TABLE settlement_runs DROP COLUMN IF EXISTS environment;

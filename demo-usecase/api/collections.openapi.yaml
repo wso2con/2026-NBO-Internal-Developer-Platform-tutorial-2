@@ -1,0 +1,635 @@
+openapi: 3.1.0
+info:
+  title: mopay collections-api
+  version: "1.0.0"
+  description: |
+    Collections intake, channel callbacks and the read APIs behind the console
+    (PRD §5.1, §5.2), at the scope agreed in `docs/SCOPE.md`.
+
+    This component also owns the continuously-updated **settlement lag** metric
+    (README hard constraint 4, OBS-4). The lag signal must keep being emitted when
+    `settlement-worker` is not running — a signal that dies with the worker cannot tell
+    you the worker died — so it is computed here on a short interval, not by the worker.
+
+    ## Authentication
+
+    Dev-mode bearer tokens, not OIDC. OIDC, identity providers, login screens and session
+    management are README.md non-goals (`docs/SCOPE.md` conflict 5).
+
+        Authorization: Bearer dev.<base64url({"sub":"...","merchantId":"...","role":"..."})>
+
+    **Authorization is not dev-mode.** C-6.2 to C-6.7 are enforced server-side on every
+    request: merchant scoping comes from the token, never from a query parameter, and the
+    console hiding a screen is explicitly not a control (C-6.6).
+
+    Money is integer minor units with an explicit currency. Timestamps are UTC.
+
+servers:
+  - url: http://localhost:8088
+    description: Local Compose
+
+tags:
+  - name: intake
+  - name: read
+  - name: operations
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness and readiness
+      operationId: health
+      security: []
+      responses:
+        "200": { description: Service is up and the datastore is reachable }
+        "503": { description: The datastore is not reachable }
+
+  /metrics:
+    get:
+      summary: Prometheus metrics (OBS-2, OBS-4)
+      operationId: metrics
+      security: []
+      description: |
+        Includes `mopay_settlement_lag_seconds`, the age of the oldest cleared unsettled
+        collection. This is the signal `settlement-lag-critical` (C-5.2) alerts on.
+      responses:
+        "200":
+          description: Prometheus text exposition format
+          content:
+            text/plain: { schema: { type: string } }
+
+  /v1/collections:
+    post:
+      tags: [intake]
+      summary: Accept a collection
+      operationId: createCollection
+      description: |
+        Accepts a collection from an authenticated merchant or service client (C-1.1).
+
+        **Idempotency (C-1.3).** `merchantReference` is the idempotency key. A repeat for
+        the same merchant returns the original collection with HTTP 200 and creates
+        nothing. Enforced by a unique constraint on `(merchantId, merchantReference)`, not
+        an application-level pre-check — a pre-check races, the constraint does not.
+
+        **Currency (C-1.8).** Derived from the channel and never accepted from the caller.
+        A `currency` field in the body is ignored. `mpesa` is KES, `nibss_transfer` is NGN.
+
+        **Float limit (C-1.5).** Refused with 409 `float_limit_exceeded` when the
+        collection would take the merchant past their float limit. The error carries the
+        current unsettled balance and the configured limit so the merchant's integration
+        can act on it programmatically.
+
+        **Fails closed.** If the unsettled balance cannot be determined — the ledger is
+        unreachable, times out, or errors — the collection is **refused** with 503, not
+        accepted. Accepting money we cannot account for is the worse failure.
+
+        A new collection starts as `pending`. It produces no ledger entry until a channel
+        callback clears it: the money is not ours to account for until then.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel, amountMinor, merchantReference]
+              properties:
+                channel:
+                  type: string
+                  enum: [mpesa, nibss_transfer]
+                  description: |
+                    PRD C-1.2 lists four channels; README.md caps this build at two, one
+                    per market (`docs/SCOPE.md` conflict 1).
+                amountMinor:
+                  type: integer
+                  format: int64
+                  minimum: 1
+                customerReference: { type: string }
+                merchantReference:
+                  type: string
+                  description: The idempotency key (C-1.3).
+      responses:
+        "201":
+          description: Collection accepted
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Collection" }
+        "200":
+          description: Idempotent replay — the original collection, unchanged
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Collection" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: The float limit would be exceeded (C-1.5)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                floatLimit:
+                  value:
+                    code: float_limit_exceeded
+                    message: "merchant mch_004 unsettled balance 183721.00 KES plus this collection 900000.00 would exceed the float limit 187395.42 KES"
+                    details:
+                      unsettledBalanceMinor: 18372100
+                      floatLimitMinor: 18739542
+                      requestedAmountMinor: 90000000
+                      currency: KES
+        "503":
+          description: |
+            The unsettled balance could not be determined, so the collection is refused.
+            This is the fail-closed path and is deliberate.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+    get:
+      tags: [read]
+      summary: Search collections (C-1.10)
+      operationId: searchCollections
+      description: |
+        Paginated. Scope: merchant reference, status and date range — amount-range and
+        customer-reference search are THIN in `docs/SCOPE.md`.
+
+        The merchant is taken from the token (C-6.2). There is no `merchantId` parameter,
+        by design: client-supplied scoping is not scoping.
+      parameters:
+        - { name: merchantReference, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [pending, cleared, failed, settled] } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        "200":
+          description: Matching collections
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Collection" }
+                  total: { type: integer, format: int64 }
+                  limit: { type: integer }
+                  offset: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/collections/{id}:
+    get:
+      tags: [read]
+      summary: A collection with its ledger entries (C-1.9)
+      operationId: getCollection
+      description: |
+        C-6.2: a merchant requesting another merchant's collection receives **404**, not
+        403 — the existence of the id is not theirs to learn.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The collection and its ledger entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  collection: { $ref: "#/components/schemas/Collection" }
+                  ledgerEntries:
+                    type: [array, "null"]
+                    items: { $ref: "#/components/schemas/LedgerEntry" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/channel-callbacks:
+    post:
+      tags: [intake]
+      summary: Asynchronous channel callback (C-1.7)
+      operationId: channelCallback
+      security: []
+      description: |
+        Moves a collection from `pending` to `cleared` or `failed`.
+
+        **Idempotent.** The update is guarded on `status = 'pending'`, so a replayed
+        callback affects zero rows and reports `changed: false`. That is not an error.
+
+        On clearing, the balancing ledger entries for the collection are written
+        (credit the merchant, debit the house account).
+
+        **Signature verification is deliberately absent.** PRD C-1.7 requires it, but
+        README.md lists channel callback signature verification as a non-goal
+        (`docs/SCOPE.md` conflict 2). This endpoint is therefore unauthenticated in dev
+        mode and must not be exposed publicly as-is.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [collectionId, outcome]
+              properties:
+                collectionId: { type: string }
+                outcome: { type: string, enum: [cleared, failed] }
+      responses:
+        "200":
+          description: The callback was applied, or was a replay
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  collection: { $ref: "#/components/schemas/Collection" }
+                  changed:
+                    type: boolean
+                    description: False for a replay — nothing changed.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502":
+          description: The collection cleared but its ledger entries could not be written
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/merchants/me:
+    get:
+      tags: [read]
+      summary: The authenticated merchant, with the residency statement (S-5, S-5.1)
+      operationId: getMerchant
+      description: |
+        `dataRegionStatement` is plain language derived from the merchant's stored
+        `dataRegion`, so S-5.1's claim is true by construction rather than by policy
+        (RES-7). The payout account number is masked (OBS-7).
+      responses:
+        "200":
+          description: The merchant
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchant: { $ref: "#/components/schemas/Merchant" }
+                  dataRegion: { type: string, enum: [KE, NG] }
+                  dataRegionStatement:
+                    type: string
+                    examples: ["Your transaction data is stored in Kenya."]
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/merchants/me/balance:
+    get:
+      tags: [read]
+      summary: Unsettled balance and float limit (C-1.11)
+      operationId: getBalance
+      responses:
+        "200":
+          description: The balance and the limit together — the console needs both to show headroom
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  merchantId: { type: string }
+                  unsettledBalanceMinor: { type: integer, format: int64 }
+                  floatLimitMinor: { type: integer, format: int64 }
+                  headroomMinor: { type: integer, format: int64 }
+                  currency: { type: string, enum: [KES, NGN] }
+                  asOf: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503":
+          description: The ledger could not be reached
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/aggregates:
+    get:
+      tags: [read]
+      summary: Collections aggregates for a date range (C-1.12)
+      operationId: getAggregates
+      description: Count, value, success rate and per-channel split, plus the hourly series behind S-1's sparkline.
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: Aggregates
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Aggregates" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/settlement-runs:
+    get:
+      tags: [read]
+      summary: Settlement runs (C-1.13)
+      operationId: listRuns
+      description: |
+        Merchant-filtered for merchant users; unfiltered for operations and finance. The
+        filter is applied server-side from the token's role, not from a parameter.
+
+        `windowSeconds` is NFR-3's two-hour window, which S-3.3 renders elapsed time
+        against.
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+      responses:
+        "200":
+          description: Runs, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/SettlementRun" }
+                  windowSeconds: { type: number }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/statements/{month}:
+    get:
+      tags: [read]
+      summary: Monthly settlement statement, JSON only (C-1.14)
+      operationId: getStatement
+      description: |
+        Totals come from the immutable settlement lines rather than being recomputed.
+
+        **JSON only.** PRD C-1.14 asks for CSV as well, but CSV export and file downloads
+        are README.md non-goals (`docs/SCOPE.md` conflict 3).
+
+        A finance-role token must name the merchant via `merchantId` (C-6.4).
+      parameters:
+        - { name: month, in: path, required: true, schema: { type: string, pattern: "^[0-9]{4}-[0-9]{2}$" } }
+        - { name: merchantId, in: query, schema: { type: string }, description: Required for finance-role tokens only. }
+      responses:
+        "200":
+          description: The statement
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Statement" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/settlement-status:
+    get:
+      tags: [operations]
+      summary: Settlement lag and last completed run — the S-3.4 banner signal
+      operationId: settlementStatus
+      description: |
+        Every console screen polls this. When `stale` is true the console shows a
+        persistent banner naming the last successful run time and the current lag (S-3.4).
+
+        Computed by this component on every call and on a short interval, independently of
+        `settlement-worker` (hard constraint 4).
+      responses:
+        "200":
+          description: Current settlement status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SettlementStatus" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/ops/run-health:
+    get:
+      tags: [operations]
+      summary: Run health across all merchants (S-6)
+      operationId: runHealth
+      description: |
+        Operations role only.
+
+        `neverStarted` distinguishes "no run has ever started" from "a run failed"
+        (S-6.1) — different operational conditions with different causes.
+
+        There is no retry operation. C-1.15 and S-6's retry action are README.md non-goals
+        (`docs/SCOPE.md` conflict 4).
+
+        C-6.3: this role cannot retrieve per-transaction customer references or amounts
+        through any endpoint, including this one.
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+      responses:
+        "200":
+          description: Run health
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunHealth" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+components:
+  securitySchemes:
+    devBearer:
+      type: http
+      scheme: bearer
+      description: |
+        Dev-mode token: `dev.<base64url({"sub","merchantId","role"})>`.
+        Roles: `merchant`, `service`, `finance`, `operations`.
+
+  responses:
+    BadRequest:
+      description: The request was malformed
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unauthorized:
+      description: No token, or the token is malformed
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Forbidden:
+      description: The role may not perform this operation (C-6.7 logs every denial)
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    NotFound:
+      description: The resource does not exist, or is not yours
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - bad_request
+            - unauthorized
+            - forbidden
+            - not_found
+            - conflict
+            - unprocessable
+            - internal_error
+            - upstream_unavailable
+            - float_limit_exceeded
+            - ledger_not_balanced
+            - append_only_violation
+            - invalid_status_transition
+            - unsupported_channel
+        message: { type: string }
+        details: { type: object, additionalProperties: true }
+
+    Collection:
+      type: object
+      description: |
+        PRD §7 Collection. `customerReference` and `amountMinor` are redacted to empty and
+        zero for roles that may not see customer detail (C-6.3, C-6.4).
+      properties:
+        id: { type: string }
+        merchantId: { type: string }
+        channel: { type: string, enum: [mpesa, nibss_transfer] }
+        amountMinor: { type: integer, format: int64 }
+        currency: { type: string, enum: [KES, NGN] }
+        customerReference: { type: string }
+        merchantReference: { type: string }
+        originCountry: { type: string, enum: [KE, NG] }
+        status:
+          type: string
+          enum: [pending, cleared, failed, settled]
+          description: |
+            One-directional (C-1.6): pending -> cleared -> settled, or pending -> failed.
+            Enforced by a database trigger, not only in code.
+        createdAt: { type: string, format: date-time }
+        clearedAt: { type: string, format: date-time }
+        settledAt: { type: string, format: date-time }
+        settlementLineId: { type: string }
+
+    LedgerEntry:
+      type: object
+      properties:
+        id: { type: string }
+        merchantId: { type: string }
+        direction: { type: string, enum: [debit, credit] }
+        amountMinor: { type: integer, format: int64 }
+        currency: { type: string, enum: [KES, NGN] }
+        createdAt: { type: string, format: date-time }
+        eventType: { type: string }
+        eventId: { type: string }
+        transactionGroupId: { type: string }
+
+    Merchant:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        country: { type: string, enum: [KE, NG] }
+        dataRegion:
+          type: string
+          enum: [KE, NG]
+          description: Immutable after creation (RES-5), enforced by a database trigger.
+        payoutBank: { type: string }
+        payoutAccountName: { type: string }
+        payoutAccountNumberMasked:
+          type: string
+          description: Masked. The full account number never leaves the datastore (OBS-7).
+        floatLimitMinor: { type: integer, format: int64 }
+        floatLimitCurrency: { type: string, enum: [KES, NGN] }
+
+    Aggregates:
+      type: object
+      properties:
+        merchantId: { type: string }
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        count: { type: integer, format: int64 }
+        valueMinor: { type: integer, format: int64 }
+        failedCount: { type: integer, format: int64 }
+        successRate: { type: number }
+        currency: { type: string, enum: [KES, NGN] }
+        byChannel:
+          type: array
+          items:
+            type: object
+            properties:
+              channel: { type: string }
+              count: { type: integer, format: int64 }
+              valueMinor: { type: integer, format: int64 }
+              failedCount: { type: integer, format: int64 }
+        hourly:
+          type: array
+          description: Hourly buckets behind S-1's 24-hour sparkline.
+          items:
+            type: object
+            properties:
+              hour: { type: string, format: date-time }
+              count: { type: integer, format: int64 }
+              valueMinor: { type: integer, format: int64 }
+
+    SettlementRun:
+      type: object
+      properties:
+        id: { type: string }
+        runType: { type: string, enum: [nightly, monthEnd] }
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+          description: S-3.1 — exactly one of these four.
+        startedAt: { type: string, format: date-time }
+        endedAt: { type: string, format: date-time }
+        rowCount: { type: integer, format: int64 }
+        failureReason:
+          type: string
+          description: |
+            Persisted for failed runs (C-2.5) and shown inline without a click (S-3.2).
+            Names the run, the merchant, the row and the cause.
+        periodStart: { type: string, format: date-time }
+        periodEnd: { type: string, format: date-time }
+        region: { type: string, enum: [KE, NG] }
+        netMinor: { type: integer, format: int64 }
+        currency: { type: string, enum: [KES, NGN] }
+
+    Statement:
+      type: object
+      properties:
+        merchantId: { type: string }
+        merchantName: { type: string }
+        month: { type: string }
+        periodStart: { type: string, format: date-time }
+        periodEnd: { type: string, format: date-time }
+        currency: { type: string, enum: [KES, NGN] }
+        grossMinor: { type: integer, format: int64 }
+        feesMinor: { type: integer, format: int64 }
+        netMinor: { type: integer, format: int64 }
+        rowCount: { type: integer, format: int64 }
+        byChannel:
+          type: array
+          items:
+            type: object
+            properties:
+              channel: { type: string }
+              count: { type: integer, format: int64 }
+              grossMinor: { type: integer, format: int64 }
+              feesMinor: { type: integer, format: int64 }
+              netMinor: { type: integer, format: int64 }
+        runIds:
+          type: array
+          items: { type: string }
+
+    SettlementStatus:
+      type: object
+      properties:
+        region: { type: string, enum: [KE, NG] }
+        lagSeconds:
+          type: number
+          description: Age of the oldest cleared, unsettled collection (OBS-4).
+        oldestUnsettledAt: { type: [string, "null"], format: date-time }
+        lastCompletedRunAt: { type: [string, "null"], format: date-time }
+        lastCompletedRunId: { type: [string, "null"] }
+        stalenessThresholdSeconds:
+          type: number
+          description: From configuration. 26h by default (S-3.4, C-5.2).
+        stale: { type: boolean }
+        unsettledCount: { type: integer, format: int64 }
+        affectedMerchants:
+          type: integer
+          format: int64
+          description: C-5.4 — alerts carry the number of affected merchants.
+
+    RunHealth:
+      type: object
+      properties:
+        runs:
+          type: array
+          items: { $ref: "#/components/schemas/SettlementRun" }
+        settlementStatus: { $ref: "#/components/schemas/SettlementStatus" }
+        windowSeconds: { type: number }
+        neverStarted:
+          type: boolean
+          description: S-6.1 — distinguishes "never started" from "failed".
+
+security:
+  - devBearer: []

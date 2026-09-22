@@ -1,0 +1,29 @@
+# Local credentials. `make env` generates this; it must never be committed.
+# Constraint 6: no secrets in source, images, config files or commits.
+.env
+.env.local
+*.pem
+*.key
+
+# Node
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Go
+*.test
+*.out
+/bin/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs and scratch
+*.log
+/tmp/
